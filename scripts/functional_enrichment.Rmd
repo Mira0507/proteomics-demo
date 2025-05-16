@@ -1,0 +1,615 @@
+---
+title: Functional enrichment analysis
+output:
+    html_document:
+        code_folding: hide
+        toc: true
+        toc_float: true
+        toc_depth: 3
+---
+
+```{r global_options, include=FALSE}
+# Sets up global options for rendering RMarkdown into HTML.
+knitr::opts_chunk$set(
+    warning=FALSE,
+    message=FALSE,
+    cache.lazy=FALSE
+)
+```
+
+```{r libraries}
+library(tidyverse)
+library(AnnotationHub)
+library(clusterProfiler)
+library(cowplot)
+library(dplyr)
+library(DT)
+library(data.table)
+library(genefilter)
+library(ggplot2)
+library(gridExtra)
+library(plotly)
+library(reshape)
+library(RColorBrewer)
+library(igraph)
+library(DESeq2)
+library(magrittr)
+library(org.Hs.eg.db)
+library(parallel)
+library(viridis)
+
+set.seed(5678)
+source('helper.R')
+```
+
+```{r variables}
+
+cores <- 8
+
+contrasts <- c(
+    'WTAx_vs_WTCb',
+    'KOAx_vs_KOCb',
+    'KOAx_vs_WTAx',
+    'KOCb_vs_WTCb',
+    'interaction'
+)
+
+input_dir <- 'output'
+
+# Define file paths to cleaned and DE tables
+tsv_list <- map(
+    contrasts,
+    ~paste0(file.path(input_dir, "tables", .x), "_DE_results.tsv")
+) %>%
+    set_names(contrasts)
+
+tsv_list[['cleaned']] <- file.path(input_dir, "tables", "cleaned_input.tsv")
+
+# DE FDR cutoff
+alpha <- 0.1
+
+# Prep orgdb
+orgdb_human <- get_orgdb('Homo sapiens', '../AnnotationHubCache/human')
+
+# NOTE: convert IDs to symbols for KEGG?---------------------------------------
+id_convert <- TRUE
+
+# Define the length of description
+truncate_to <- 100
+
+# Set direction of enrichment:
+# dn, up
+up_dn <- c("dn", "up", "changed")
+
+# Set the number of terms to display
+n_gs <- 12
+
+# KEGG organism code
+# consult https://www.genome.jp/kegg/catalog/org_list.html
+# kegg.organism <- list(SC='mmu', Ax='hsa', Cb='hsa')
+kegg.organism <- 'hsa'
+
+# Set user variables for plotting
+font_size <- 12
+
+# Define a directory name to save plots
+cprof.folder <- "output"
+if (!dir.exists(cprof.folder)) { dir.create(cprof.folder) }
+```
+
+Here, we perform functional enrichment analysis on differentially expressed proteins (DEPs)
+identified in the previous analysis:
+
+- [de_ax_cb_sp3.html](de_ax_cb_sp3.html)
+
+Contrasts:
+
+- `WTAx_vs_WTCb`: WT_Ax vs WT_Cb
+- `KOAx_vs_KOCb`: KO_Ax vs KO_Cb 
+- `KOAx_vs_WTAx`: KO_Ax vs WT_Ax
+- `KOCb_vs_WTCb`: KO_Cb vs WT_Cb
+- `interaction`: (KO_Ax vs KO_Cb) vs (WT_Ax vs WT_Cb)
+
+In each contrast marked `A vs B`, `A` and `B` are experimental and control groups respectively.
+This suggests changes in `A` compared to `B`.
+
+This analysis is performed using the [clusterProfiler](https://pubmed.ncbi.nlm.nih.gov/22455463/)
+package in R by exploring the following ontology databases: 
+
+- [GO](https://pubmed.ncbi.nlm.nih.gov/10802651/) CC (Cellular Component)
+- GO BP (Biological Process)
+- GO MF (Molecular Function)
+- [KEGG](https://pubmed.ncbi.nlm.nih.gov/10592173/)
+- [DO](https://pubmed.ncbi.nlm.nih.gov/22080554/) (Disease Ontology)
+
+
+The enrichment of each gene set is examined using 
+[Fisher's exact test](https://www.pathwaycommons.org/guide/primers/statistics/fishers_exact_test/), followed 
+by the [Benjamini-Hochberg (BH) method](https://en.wikipedia.org/wiki/False_discovery_rate) to calculate 
+the raw p-values and false discovery rates (FDRs), respectively.
+
+
+```{r import_input}
+
+# Import DE tables from proteomics
+protein_list <- map(tsv_list, read_tsv)
+
+# Raise an error if missing value imputation is required
+if (sum(is.na(protein_list))) {
+    stop("Missing values are found in the protein.list!")
+}
+
+# Prep a vector for all detected genes in all human cells
+universe <- protein_list[['cleaned']] %>%
+    as.data.frame %>%
+    pull(Genes) %>%
+    map(~paste0(.x, collapse=";")) %>%
+    map(~str_split(.x, pattern=";")) %>%
+    unlist() %>%
+    unique()
+
+# Filter the `protein_list` to include only DE results
+protein_list <- protein_list[names(protein_list) != "cleaned"]
+
+# Create a list of cleaned res data frames
+de_list <- list()
+
+for (contr_i in names(protein_list)) {
+    # Prep a list for significant up, down and changed proteins
+    df <- protein_list[[contr_i]] %>%
+        dplyr:::filter(adj.P.Val <= alpha) %>%
+        mutate(direction=ifelse(logFC > 0, 'up', 'down'))
+
+    # Add unique gene names corresponding to the differentially enriched proteins
+    # by change direction to the `de_list`
+    if (nrow(df) > 0) {
+        df_list <- split(df, df$direction)
+        df_list[['changed']] <- df
+        df_list <- map(df_list, ~.x %>% 
+            pull(Genes) %>%
+            paste0(collapse=";") %>%
+            str_split(pattern=";") %>%
+            unlist %>%
+            unique
+        )
+    } else {
+        df_list <- NULL
+    }
+    de_list[[contr_i]] <- df_list
+}
+
+# Remove NULL contrasts
+de_list <- de_list[!map_lgl(de_list, is.null)]
+```
+
+
+```{r map_gene_symbols}
+
+# Specify a keytype to be mapped
+keytype <- "SYMBOL"
+# Specify columns to be retrieved
+column <- 'UNIPROT'
+
+id_list <- mclapply(names(de_list), function(name) {
+
+    anno_list <- map(names(de_list[[name]]), function(direction) {
+    
+        # Extract keys to be mapped
+        keys <- de_list[[name]][[direction]]
+        anno_df <- if (length(keys) > 0) {
+
+            # Map gene symbols to uniprot IDs
+            id_vec <- mapIds(
+                orgdb_human,
+                keys=keys,
+                column=column,
+                keytype=keytype,
+                multiVal='first'
+            ) %>%
+                unlist()
+
+            # Impute NAs with keytype
+            id_vec[is.na(id_vec)] <- names(id_vec)[is.na(id_vec)]
+            # Conver vector to df
+            anno_df <- id_vec %>%
+                as.data.frame() %>%
+                rownames_to_column(keytype)
+            # Clean column names
+            colnames(anno_df) <- c(keytype, column)
+            as.data.frame(anno_df)
+        } else {
+            NULL
+        }
+        return(anno_df)
+    }) %>%
+    set_names(names(de_list[[name]]))
+    anno_list <- anno_list[!is.null(anno_list)]
+    return(anno_list)
+}) %>%
+    set_names(names(de_list))
+
+```
+
+```{r map_universe_genes}
+
+# Map universe genes 
+id_vec <- mapIds(
+    orgdb_human,
+    keys=universe,
+    column=column,
+    keytype=keytype,
+    multiVal='first'
+) %>%
+    unlist()
+
+# Return a list for keytype and column
+univ_list <- list()
+univ_list[[keytype]] <- unique(names(id_vec))
+univ_list[[column]] <- unique(id_vec)
+univ_list <- map(univ_list, unlist) %>%
+    map(unique)
+
+```
+
+```{r enrichall, cache=TRUE}
+
+# NOTE: settings for clusterProfiler and plots---------------------------------
+go.keytype <- 'SYMBOL'    # CHANGE
+kegg.keytype <- 'UNIPROT'   # identical to ENTREZID. Other options are "kegg", 'ncbi-proteinid' and 'uniprot'
+pvalueCutoff <- 1
+qvalueCutoff <- 1
+
+all_enrich <- list()
+enrich_files <- list()
+
+for (contrast in names(de_list)) {
+
+    all_enrich[[contrast]] <- list()
+    enrich_files[[contrast]] <- list()
+    for (direction in names(de_list[[contrast]])) {
+
+        gene <- id_list[[contrast]][[direction]][[go.keytype]]
+        all_enrich[[contrast]][[direction]] <- list()
+        universe <- univ_list[[go.keytype]]
+
+        # Loop over each ontology
+        for (ont in c('CC', 'BP', 'MF')) {
+
+            go_res <- enrichGO(gene=gene,
+                               universe=universe,  # narrowed to detected genes (baseMean > 0) with up or down log2FoldChanges
+                               keyType=go.keytype,
+                               OrgDb=orgdb_human,
+                               ont=ont,
+                               pvalueCutoff=pvalueCutoff,
+                               qvalueCutoff=qvalueCutoff,
+                               readable=FALSE)
+
+            res_label <- paste('GO', ont, sep='_')
+            all_enrich[[contrast]][[direction]][[ont]] <- go_res
+            # Add a space to prevent the GeneRatio and BgRatio columns from being converted to 
+            # date format in excel
+            go_res@result <- go_res@result %>%
+                mutate(GeneRatio=paste0(" ", GeneRatio),
+                       BgRatio=paste0(" ", BgRatio))
+            if (!is.null(go_res)) {
+                enrich_files[[contrast]][[direction]][[ont]] <- write.clusterprofiler.results(
+                    go_res,
+                    cprof.folder,
+                    paste(res_label, contrast, direction, sep='_')) }
+        }
+
+
+        # Perform KEGG enrichment
+        res_label <- 'KEGG'
+        gene <- id_list[[contrast]][[direction]][[kegg.keytype]]
+        universe <- univ_list[[kegg.keytype]]
+        kegg_res <- enrichKEGG(gene=gene,
+                               universe=universe,
+                               organism=kegg.organism,
+                               keyType=tolower(kegg.keytype),
+                               pvalueCutoff=pvalueCutoff,
+                               qvalueCutoff=qvalueCutoff)
+
+        if (!is.null(kegg_res)){
+            # convert uniprot IDs to readable symbols. This needs to be done separately
+            # in the case of KEGG
+            if(id_convert){
+                id_df <- id_list[[contrast]][[direction]]
+                id_vec <- id_df[[go.keytype]]
+                names(id_vec) <- id_df[[kegg.keytype]]
+                kegg_res_genes <- kegg_res@result$geneID
+                for(j in 1:length(kegg_res_genes)){
+                    id_split <- strsplit(kegg_res_genes[j], "/")[[1]]
+                    temp <- paste(id_vec[id_split], collapse="/")
+                    kegg_res@result$geneID[j] <- temp
+                }
+            }
+
+            all_enrich[[contrast]][[direction]][['kegg']] <- kegg_res
+            kegg_res@result <- kegg_res@result %>%
+                mutate(GeneRatio=paste0(" ", GeneRatio),
+                       BgRatio=paste0(" ", BgRatio))
+            enrich_files[[contrast]][[direction]][['kegg']] <- write.clusterprofiler.results(
+                kegg_res, cprof.folder, paste(res_label, contrast, direction, sep='_'))
+        }
+    }
+}
+
+```
+
+```{r enrich_do, cache=TRUE, dependson='enrichall'}
+
+# Explore Disease Ontology (DO)
+
+res_label <- 'DO'
+for (contrast in names(de_list)) {
+    for (direction in names(de_list[[contrast]])) {
+
+        gene <- id_list[[contrast]][[direction]][[go.keytype]]
+        universe <- univ_list[[go.keytype]]
+        # Map protein IDs to ENTREZ IDs
+        id_vec <- mapIds(
+            orgdb_human,
+            keys=universe,
+            column='ENTREZID',
+            keytype=go.keytype,
+            multiVal='first'
+        ) %>%
+        unlist()
+
+        gene <- id_vec[gene]
+        # Reset organism code
+        organism <- if (kegg.organism == "mmu") {
+            "mm"
+        } else if (kegg.organism == "hsa") {
+            "hsa"
+        } else {
+            stop(past(kegg.organism, "not supported for DO analysis!"))
+        }
+
+        # Perform DO enrichment
+        do_res <- enrichDO(
+            gene=gene,
+            universe=id_vec,
+            organism=organism,
+            # keyType=tolower(kegg.keytype),
+            pvalueCutoff=pvalueCutoff,
+            qvalueCutoff=qvalueCutoff)
+
+        if (!is.null(do_res)){
+            # convert ENTREZ IDs to readable symbols. This needs to be done separately
+            if(id_convert){
+                do_res_genes <- do_res@result$geneID
+                for(j in 1:length(do_res_genes)){
+                    id_split <- strsplit(do_res_genes[j], "/")[[1]] 
+                    ids <- id_vec[id_vec %in% id_split] %>% names()
+                    temp <- paste(ids, collapse="/")
+                    do_res@result$geneID[j] <- temp
+                }
+            }
+
+            all_enrich[[contrast]][[direction]][[res_label]] <- do_res
+            do_res@result <- do_res@result %>%
+                mutate(GeneRatio=paste0(" ", GeneRatio),
+                       BgRatio=paste0(" ", BgRatio))
+            enrich_files[[contrast]][[direction]][[res_label]] <- write.clusterprofiler.results(
+                do_res, cprof.folder, paste(res_label, contrast, direction, sep='_'))
+        }
+    }
+}
+
+```
+
+# Tables {.tabset}
+
+The enrichment of gene sets is analyzed based on the following categories:
+
+- `up`: gene sets enriched with differentially upregulated proteins (up DEPs)
+- `down`: gene sets enriched with differentially downregulated proteins (down DEPs)
+- `changed`: gene sets enriched with the union of up and down DEPs
+
+Full tables are accessible through the following links, available in an excel-readable TSV format. 
+The `orig` and `split` tables correspond to tables with one term per row and one gene per row, respectively.
+
+Each metric is described as summarized below:
+
+- **GeneRatio**: The number of DEPs annotated to a gene set (=Count) over the number of all input DEPs
+- **BgRatio**: The number of proteins in a gene set over the number of all unique proteins
+  in the _universe_ present in each DB
+- **pvalue**: The chance of each gene set being significantly enriched
+- **p.adjust**: FDR, the chance of each gene set being a false discovery, calculated using the BH method
+- **Count**: The number of input DEPs annotated to each gene set
+- **FoldEnrichment**: GeneRatio / BgRatio, representing the ratio of the frequency of input proteins
+  annotated to a gene set to the frequency of all genes annotated to that gene set
+- **RichFactor**: The number of input DEPs annotated to a gene set divided by the number 
+  of all proteins annotated to a gene set
+- **zScore**: A measure of how far a particular observation (in this case, enrichment) deviates 
+  from the mean expected under the null hypothesis of no enrichment
+
+Note that proteins are discarded if they are not in the given DB. Output tables are not generated if 
+the analysis was skipped due to too few input DEPs.
+
+
+```{r enrich_table, results='asis'}
+
+# Save and print functional enrichment tables
+for (contrast in names(all_enrich)) {
+    cat('##' , contrast, '{.tabset}\n\n')
+    # Prep links to individual tsv files
+    df <- as.data.frame(enrich_files[[contrast]])
+    path_df <- data.frame(
+        path=unlist(df)
+    ) %>%
+        rownames_to_column('label') %>%
+        separate(label, c('direction', 'ontology', 'table'), sep="\\.") %>%
+        mutate(path=paste("[", path, "](", path, ")")) %>%
+        pivot_wider(names_from=table, values_from=path)
+    print(knitr::kable(path_df))
+}
+
+```
+
+# Plots {.tabset}
+
+```{r plotgo, fig.show='hide', cache=TRUE, dependson='enrich_do'}
+# Plot the enrichment results.
+
+plot_list <- list()
+
+# Create a vector for plot names
+all_plots <- c('dotplot', 'emapplot', 'cnetplot')
+
+# Loop over contrast
+for (contrast in names(all_enrich)) {
+    plot_list[[contrast]] <- list()
+    # Loop over change direction
+    for (direction in names(all_enrich[[contrast]])) {
+        plot_list[[contrast]][[direction]] <- list()
+        # Loop over ontology
+        for (go in names(all_enrich[[contrast]][[direction]])) {
+  
+            # Extract an enrichResult obj
+            res <- all_enrich[[contrast]][[direction]][[go]]
+            # Skip if it has no enriched gene sets
+            if (is.null(res)) {
+                cat('\n\n\nNo genes enriched for:',
+                    contrast,
+                    direction,
+                    go, '\n\n\n\n')
+                next
+            }
+
+            # Create a list for each plot path
+            filename_list <- lapply(
+                all_plots, 
+                function(plot_i) file.path(
+                    cprof.folder,
+                    paste0(contrast, '_', direction, '_', go, '_', plot_i, '.pdf'))
+            ) %>%
+                set_names(all_plots)
+            title <- go
+
+            # Create an empty list for storing plots
+            plot_list[[contrast]][[direction]][[go]] <- list()
+
+            # Create a dotplot and save
+            res <- truncate(res, truncate_to)
+            dot_p <- enrichplot::dotplot(
+                res,
+                showCategory=n_gs,
+                font.size=font_size,
+                color="p.adjust",
+                x="GeneRatio"
+            ) + 
+            ggtitle(title) + 
+            theme(plot.title=element_text(hjust=0.5, size=15, face='bold'))
+  
+            ggsave(
+                filename_list[['dotplot']],
+                dot_p,
+                width=10,
+                height=8,
+                device='pdf'
+            )
+
+            plot_list[[contrast]][[direction]][[go]][['dotplot']] <- dot_p
+
+            # Create an emapplot and save
+            # If there is only one gene, then we don't have a directed graph --
+            # "Error in graph_to_tree(graph, mode = direction) : Graph must be directed"
+            if (nrow(res@result) > 1){
+                emap_p <- tryCatch(
+                    expr={
+                        r <- pairwise_termsim(res)
+                        enrichplot::emapplot(
+                            r,
+                            # cex_label_category=0.7
+                            color="p.adjust"
+                        ) +
+                            ggtitle(title) + 
+                            theme(plot.title=element_text(hjust=0.5, size=15, face='bold'))
+                        },
+                    error=function(e) { }
+                    )
+                if (!is.null(emap_p)) {
+                    ggsave(
+                        filename_list[['emapplot']],
+                        emap_p,
+                        device='pdf',
+                        width=12,
+                        height=12)
+                    plot_list[[contrast]][[direction]][[go]][['emapplot']] <- emap_p
+                }
+            }
+
+            # Create a cnetplot and save
+            cnet_p <- enrichplot::cnetplot(
+                res,
+                showCategory=5,
+                foldChange=NULL,
+                colorEdge=FALSE,
+                circular=FALSE,
+                node_label="all"
+            ) + 
+            ggtitle(title) + 
+            theme(plot.title=element_text(hjust=0.5, size=15, face='bold'))
+
+            ggsave(
+                filename_list[['cnetplot']],
+                cnet_p,
+                device='pdf',
+                width=12,
+                height=12)
+
+            plot_list[[contrast]][[direction]][[go]][['cnetplot']] <- cnet_p
+
+        }
+    }
+}
+
+```
+
+```{r printgo, results='asis', fig.height=8, fig.width=8}
+
+# Loop over contrast
+for (contrast in names(plot_list)) {
+    cat('##', contrast, '{.tabset}\n\n')
+    # Loop over change direction
+    for (direction in names(plot_list[[contrast]])) {
+        cat('###', direction, '{.tabset}\n\n')
+        # Loop over ontology
+        for (go in names(plot_list[[contrast]][[direction]])) {
+
+            # Create a list for each plot path
+            filename_list <- lapply(
+                all_plots, 
+                function(plot.i) file.path(
+                    cprof.folder, 
+                    paste0(contrast, '_', direction, '_', go, '_', plot.i, '.pdf'))
+                ) %>%
+                set_names(all_plots)
+
+            cat('####', go, '{.tabset}\n\n')
+            for (plotname in names(plot_list[[contrast]][[direction]][[go]])) {
+                plot_i <- plot_list[[contrast]][[direction]][[go]][[plotname]]
+                if (!is.null(plot_i)) {
+                    cat('#####', plotname, '\n\n')
+                    print(plot_i)
+                    cat('\n\n')
+                    link.plot(filename_list[[plotname]])
+                }
+            }
+        }
+    }
+}
+```
+
+
+# Session info
+For reproducibility purposes, here is the output of `sessionInfo()` showing the
+versions of all packages used here.
+
+```{r session_info, collapse=FALSE}
+sessionInfo()
+```
+
