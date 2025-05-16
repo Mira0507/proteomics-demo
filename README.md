@@ -14,6 +14,7 @@ $ tree
 ├── env.yaml
 ├── README.md
 └── scripts
+    ├── functional_enrichment.Rmd
     ├── helper.R
     └── proteomics_de.Rmd
 
@@ -23,6 +24,10 @@ $ tree
 
 - `env.yaml` conda environment
 - `scripts/helper.R`: helper functions
+
+
+### Analysis scripts
+
 - `scripts/proteomics_de.Rmd`
     - Dataset overview
     - Quality control
@@ -36,4 +41,17 @@ $ tree
         - MA plot
         - Volcano plot
         - P-value distribution
-    - Result table
+    - Result tables
+
+- `scripts/functional_enrichment.Rmd`
+    - Enriched gene sets calculated using [clusterProfiler](https://pubmed.ncbi.nlm.nih.gov/22455463/)
+        - [GO](https://pubmed.ncbi.nlm.nih.gov/10802651/) Cellular Component (CC)
+        - GO Biological Process (BP)
+        - GO Molecular Function (MF)
+        - [kyoto encyclopedia of genes and genomes (KEGG)](https://pubmed.ncbi.nlm.nih.gov/10592173/)
+        - [Disease Ontology (DO)](https://pubmed.ncbi.nlm.nih.gov/22080554/)
+    - Result tables
+    - Plots
+        - [Dotplot](https://yulab-smu.top/biomedical-knowledge-mining-book/enrichplot.html#dot-plot)
+        - [Emapplot](https://yulab-smu.top/biomedical-knowledge-mining-book/enrichplot.html#enrichment-map)
+        - [Cnetplot](https://yulab-smu.top/biomedical-knowledge-mining-book/enrichplot.html#cnetplot)
