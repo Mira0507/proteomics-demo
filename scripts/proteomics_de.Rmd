@@ -1,0 +1,846 @@
+---
+title: Differential expression analysis
+output:
+    html_document:
+        code_folding: hide
+        toc: true
+        toc_float: true
+        toc_depth: 3
+---
+
+```{r global_options, include=FALSE}
+# Sets up global options for rendering RMarkdown into HTML.
+knitr::opts_chunk$set(
+    # echo=FALSE,
+    warning=FALSE,
+    message=FALSE
+)
+```
+
+Last run: `r date()`
+
+
+```{r libraries}
+library(tidyverse)
+library(AnnotationHub)
+library(BiocParallel)
+library(cowplot)
+library(DESeq2)
+library(edgeR)
+library(limma)
+library(DEqMS)
+library(DT)
+library(ggplot2)
+library(UpSetR)
+library(RColorBrewer)
+library(viridis)
+library(gridExtra)
+library(plotly)
+library(reshape)
+
+set.seed(1234)
+source('helper.R')
+```
+
+```{r user_variables}
+
+# use limma normalization?
+limma_norm <- FALSE
+
+# is input intensity?
+is_intensity <- TRUE
+
+# Paths to input tables
+inputpath.list <- c(
+    Ax="DIA_proteomics_Ax.tsv",
+    Cb="DIA_proteomics_Cb.tsv"
+)
+
+# Cutoff for removing low-expressed or undetected proteins
+cutoff.list <- c(
+    WTAx_vs_WTCb=7,
+    KOAx_vs_KOCb=7,
+    KOAx_vs_WTAx=3,
+    KOCb_vs_WTCb=6,
+    interaction=7
+)
+
+# Define levels
+genotype.level <- c('WT', 'KO')
+celltype.level <- c('Ax', 'Cb')
+
+# ID column (this column will be used to set rownames)
+id.col <- 'UniProtIds'
+
+# Define font size
+user.font <- 12
+
+# Define figure dimensions
+fig.height <- 4
+fig.width <- 6
+
+# Define FDR cutoff
+alpha <- 0.1
+
+
+# Define LFC threshold
+lfc.thresh <- 0
+
+# Define the number of differentially expressed genes (DEGs)
+Ndeg <- 200
+
+# Create a vector for columns of interest in colData
+analysis.groups <- c('group', 'celltype', 'genotype')
+contrast.group <- 'group'
+
+# Specify outlier samples to be removed
+outliers <- c('WT4_Cb', 'KO1_Cb')
+
+# Define output directory paths
+output.directory <- 'output'
+table.directory <- file.path(output.directory, 'tables')
+figure.directory <- file.path(output.directory, 'figures')
+
+for (d in c(output.directory, table.directory, figure.directory)) {
+    if (!dir.exists(d)) { dir.create(d) }
+}
+```
+
+```{r data_setup}
+
+# Import mass spec data
+df.list <- map(inputpath.list, ~read_tsv(
+    .x,
+    ) %>%
+    as.data.frame()
+    )
+
+# Clean column names and values
+df.list <- map(df.list, function(df) {
+
+    # Remove unwanted columns
+    df <- df[, ! str_detect(colnames(df), "Precursor")]
+    colnames(df) <- stringr::str_replace_all(
+        colnames(df),
+        '.raw.PG.Quantity|PG\\.|111224_BM_SC_|_DIA',
+        ''
+    ) %>%
+        map_chr(~str_replace_all(.x, "\\[[:digit:]+\\][[:space:]]", "")) %>%
+        map_chr(~str_replace_all(.x, "^[[:digit:]]+_(BM)_(Ax)_", "")) %>%
+        map_chr(~str_replace_all(.x, "^[[:digit:]]+_(BM)_(CB)_", ""))
+    return(df) })
+
+# Column names not for samples
+nonsample.cols <- c('Genes', 'ProteinDescriptions', 'UniProtIds')
+
+df.list <- map(df.list, function(df) {
+
+    # Create a vector storing sample names
+    sample_cols <- colnames(df)[!colnames(df) %in% nonsample.cols] %>%
+        sort()
+
+    # Convert vectors for values from character to numeric
+    df <- df %>%
+        mutate_at(sample_cols, as.numeric, na.rm=FALSE)
+
+    return(df) })
+
+# Join two data frame from two mass spec runs
+all.df <- full_join(
+    df.list[[1]],
+    df.list[[2]], 
+    by=nonsample.cols,
+    suffix=paste0("_", names(df.list))
+)
+
+# Impute missing gene symbols with protein names
+all.df[['Genes']] <- ifelse(
+    is.na(all.df$Genes),
+    all.df$UniProtIds,
+    all.df$Genes)
+# Impute missing protein names with gene symbols
+all.df[['UniProtIds']] <- ifelse(
+    is.na(all.df$UniProtIds),
+    all.df$Genes,
+    all.df$UniProtIds)
+
+# Impute missing values with zero in a sliced matrix
+rownames(all.df) <- all.df[[id.col]]
+mat_input <- all.df[,!colnames(all.df) %in% nonsample.cols]
+mat_input[is.na(mat_input)] <- 0
+
+# Transform the matrix to log2 scale with a pseudocount of 1, if the input is intensity
+if (is_intensity) {
+    mat <- log2(mat_input + 1)
+} else {
+    mat <- mat_input
+}
+
+# Reorder column names
+mat <- mat[, sort(colnames(mat))]
+
+# Replace the sample columns with the imputed sample matrix
+input.df <- cbind(
+    all.df[,colnames(all.df) %in% nonsample.cols],
+    mat
+)
+
+# Remove outlier samples if specified
+if (!is.null(outliers)) {
+    input.df <- input.df[, ! colnames(input.df) %in% outliers]
+    mat <- mat[, ! colnames(mat) %in% outliers]
+}
+
+# Break if any remaining missing values are found
+if (sum(is.na(input.df))) {
+    stop("Missing values are found!")
+}
+
+# Save cleaned full input data frame
+write.table(
+    input.df,
+    file.path(table.directory, "cleaned_input.tsv"),
+    quote=FALSE,
+    row.names=FALSE,
+    col.names=TRUE,
+    sep="\t"
+)
+```
+
+
+```{r coldata_setup}
+
+# Create metadata
+colData <- data.frame(row.names=colnames(mat),
+                      samplename=colnames(mat)) %>%
+    mutate(genotype=ifelse(str_detect(samplename, "WT"), "WT", "KO"),
+           genotype=factor(genotype, levels=genotype.level),
+           celltype=ifelse(str_detect(samplename, 'Ax'), 'Ax', 'Cb'),
+           celltype=factor(celltype, levels=celltype.level)) %>% 
+    unite("group", genotype:celltype, remove=FALSE) %>%
+    mutate(group=factor(group, levels=c('WT_Ax', 'WT_Cb', 'KO_Ax', 'KO_Cb'))) %>%
+    arrange(group)
+
+```
+
+```{r create_dgelist}
+
+# This analysis follows the demonstration from
+# https://ucdavis-bioinformatics-training.github.io/2018-June-RNA-Seq-Workshop/thursday/DE.html
+
+# Build DGEList obj
+dge_initial <- DGEList(mat)
+
+# See https://www.rdocumentation.org/packages/edgeR/versions/3.14.0/topics/calcNormFactors for more info
+# NOTE: TMM is for RNA-seq. Use `upperquartile` for proteomics
+if (limma_norm) {
+    norm.method <- 'upperquartile'
+} else {
+    norm.method <- 'none'
+}
+
+# Calculate normalization factors
+dge_initial <- calcNormFactors(dge_initial, method=norm.method)
+
+# Filter out low-expressed proteins
+drop.list <- map(cutoff.list, ~which(apply(dge_initial$counts, 1, mean) < .x))
+dge.list <- map(drop.list, ~dge_initial[-.x,]) %>%
+    set_names(names(cutoff.list))
+
+```
+
+# Experiment overview
+
+Here is the sample table with metadata used for this analysis:
+
+```{r print_coldata, results='asis'}
+DT::datatable(colData)
+```
+
+```{r normalization_filtering}
+# Print normalization option
+norm_status <- ifelse(limma_norm, "raw", "normalized")
+msg <- c(
+    paste("Outlier samples removed:", paste0(outliers, collapse=", ")),
+    paste("Provided input:", norm_status, "values"),
+    paste("Before filtering:", dim(dge_initial)[1], "proteins"),
+    paste0(
+        "Filtering input proteins based on the mean abundance of the following intensities (in log2-scale):"),
+    map(names(cutoff.list), ~paste0("-- ", .x, ": ", cutoff.list[[.x]]))
+)
+
+for (m in msg) {
+    print(m)
+}
+
+# Print the number of proteins before and after filtering
+print("Remaining proteins in")
+for (name in names(dge.list)) {
+    m <- paste0(
+        "-- ",
+        name, 
+        ": ",
+        dim(dge.list[[name]])[1]
+        )
+    print(m)
+}
+```
+
+The cutoff for filtering proteins was determined based on the _mean-variance relationship_ by subset.
+
+# Sample similarity and QC
+
+## Clustered heatmap
+
+In the current QC, heatmap is used to visualize hierarchical clustering of pairwise distances between samples. 
+Darker blue means less distant (i.e. more similar) based on log2-transformed abundance values (intensity).
+In general we expect to see replicates clustering together and separation of treatments.
+
+
+```{r sample_heatmap, resuls='asis', fig.width=8, fig.height=6}
+
+# distmat <- cpm(dge, log=TRUE) <--- `cpm` applied for RNA-seq only
+distmat <- mat
+
+# Prep a distance matrix
+sampleDistsMatrix <- as.matrix(dist(t(distmat)))
+if (!identical(rownames(sampleDistsMatrix), colnames(distmat))) {
+    rownames(sampleDistsMatrix) <- colnames(distmat)
+}
+
+# Set color to be displayed
+colors <- colorRampPalette(rev(RColorBrewer::brewer.pal(9, 'Blues')))(255)
+
+# Print heatmap
+heatmaply::heatmaply(
+    sampleDistsMatrix,
+    scale='none',
+    col=colors,
+    row_side_colors=colData,
+    showticklabels=c(FALSE,TRUE))
+```
+
+## PCA {.tabset}
+
+Another way of looking at sample clustering is principal components analysis (PCA). The x- and y-axes 
+do not have units, rather, they represent the dimensions along which the samples vary the most. The amount 
+of variance explained by each principal component is indicated in the axes label.
+
+```{r pca, results='asis', fig.width=8, fig.height=6}
+
+# Run PCA
+pr <- prcomp(as.data.frame(t(distmat)), scale=FALSE, center=FALSE)
+pr.var <- pr$sdev^2
+pve <- pr.var/sum(pr.var)
+
+for(group.i in analysis.groups){
+    cat('###', group.i, '\n\n')
+    pr.x <- as.data.frame(pr$x)[, 1:2] %>%
+        rownames_to_column('samplename') %>%
+        inner_join(colData, by='samplename')
+
+    p <- ggplot(data=pr.x,
+                aes_string(x='PC1', y='PC2', color=group.i, label=group.i)) +
+          geom_point(size=5, alpha=0.7) +
+          theme_bw() +
+          xlab(paste0('PC1: ', round(pve[1]*100), '% variance')) +
+          ylab(paste0('PC2: ', round(pve[2]*100), '% variance')) +
+          coord_fixed()
+    cat('\n\n')
+    subchunkify('pca', object='plot')
+    cat('\n\n')
+}
+
+```
+
+## Normalization factors {.tabset}
+
+Normalization is skipped by specifying the normalization factors to 1 for pre-normalized input values.
+
+
+```{r sizefactors, results='asis'}
+# Note that when loading Salmon or Kallisto, DESeq2 does not calculate size
+# factors.
+
+normsize.df <- as.data.frame(dge.list[['interaction']]$samples) %>%
+    rownames_to_column('samplename')
+
+colnames(normsize.df)[3:4] <- c('library_size', 'normalization_factors')
+
+cat('### Normalization factors\n\n')
+p <- ggplot(normsize.df, aes(x=samplename, y=normalization_factors)) +
+    geom_bar(stat='identity') +
+    theme_bw() +
+    theme(axis.text.x=element_text(angle=90, hjust=0.1, vjust=1))
+ggplotly(p)
+
+cat("### Normalization factors vs total read count\n\n")
+p <- ggplot(normsize.df, aes(x=library_size, y=normalization_factors)) +
+    geom_point(size=3) +
+    theme_bw() +
+    theme(axis.text.x=element_text(angle=90, hjust=0.1, vjust=1))
+ggplotly(p)
+```
+
+# Differential expression analysis
+
+Now we perform differential expression analysis for the following contrasts:
+
+- `WTAx_vs_WTCb`: WT_Ax vs WT_Cb
+- `KOAx_vs_KOCb`: KO_Ax vs KO_Cb 
+- `KOAx_vs_WTAx`: KO_Ax vs WT_Ax
+- `KOCb_vs_WTCb`: KO_Cb vs WT_Cb
+- `interaction`: (KO_Ax vs KO_Cb) vs (WT_Ax vs WT_Cb)
+
+In each contrast marked `A vs B`, `A` and `B` are experimental and control groups, respectively. 
+This suggests changes in `A` compared to `B`.
+
+```{r setting_subset_dge}
+
+lst <- list(
+    # ------------------------------------------------------------------
+    # NOTE: Delete these for real data!
+    # They are just examples to demonstrate functionality.
+    #
+    # main: all samples
+    WTAx_vs_WTCb=list(
+        sampletable=colData %>% dplyr::filter(genotype == "WT"),
+        design=~0+group),
+    KOAx_vs_KOCb=list(
+        sampletable=colData %>% dplyr::filter(genotype == "KO"),
+        design=~0+group), 
+    KOAx_vs_WTAx=list(
+        sampletable=colData %>% dplyr::filter(celltype == "Ax"),
+        design=~0+group),
+    KOCb_vs_WTCb=list(
+        sampletable=colData %>% dplyr::filter(celltype == "Cb"),
+        design=~0+group),
+    interaction=list(
+        sampletable=colData,
+        design=~0+group)
+    )
+
+# Build lists for dge obj and the number of removed proteins
+dge_list <- list()
+drop_list <- list()
+for (name in names(lst)) {
+    contrast_i <- lst[[name]]
+    # Slice count matrix
+    sample_i <- rownames(contrast_i[['sampletable']])
+    mat_i <- mat[, sample_i]
+
+    # Create a dge obj
+    dge_i <- DGEList(mat_i)
+
+    # Calculate normalization factors
+    dge_i <- calcNormFactors(dge_i, method=norm.method)
+
+    # Filter out low-expressed proteins
+    drop <- which(apply(dge_i$counts, 1, mean) < cutoff.list[[name]])
+
+    # Update the `dge_list` with filtered dge
+    dge_list[[name]] <- dge_i[-drop,]
+    # Update the `drop_list` with the number of removed proteins
+    drop_list[[name]] <- length(drop)
+}
+```
+
+## Fitting linear models {.tabset}
+
+Prior to testing differential expression via estimating gene-wise variance using empirical Bayes, limma 
+fits a linear model for each protein. The linear models across the proteins are inspected by examining 
+_the relationship between mean protein abundance and variance_. Limma assumes that variance (y-axis) 
+decreases as mean abundance increases (x-axis). Datasets not meeting this assumption require alternative 
+approaches to limma. _Residual standard error (RSE)_ per protein is used as a metric for validating model 
+fit, with a better fit corresponding to smaller RSE values.
+
+```{r fit_linear_model, results='asis'}
+
+# Create a list for model matrices
+mm.list <- map(lst, function(l) {
+    # Build a model matrix
+    group_ <- l$sampletable[[contrast.group]]
+    mm <- model.matrix(~ 0 + group_)
+
+    # Slice matrix columns
+    samplename <- paste0('group_', group_)
+    mm <- mm[, colnames(mm) %in% samplename]
+    return(mm)
+})
+
+cat('### Mean-variance relationship {.tabset}\n\n')
+for (name in names(mm.list)) {
+    cat('####', name, '\n\n')
+    # Prep input counts
+    counts <- if (limma_norm) {
+        # Extract normalized counts from the dge obj
+        dge_list[[name]]$counts
+    } else {
+        # Create a vector for proteins whose abundance values are greater than the cutoffs
+        proteins <- rownames(dge_list[[name]]$counts)
+        # Subset the matrix by proteins and samples of interest
+        mat_filtered <- mat_input[proteins, rownames(lst[[name]]$sampletable)]
+    }
+    # voom(counts, mm.list[[name]], plot=TRUE)
+    counts <- as.data.frame(dge_list[[name]]$counts) %>%
+        rownames_to_column('Protein') %>%
+        gather('samplename', 'values', -Protein) %>%
+        group_by(Protein) %>%
+        summarize(SD=sd(values), Mean=mean(values))
+    p <- ggplot(counts, aes(x=Mean, y=SD)) +
+        geom_point(alpha=0.5, size=1) +
+        theme_bw() +
+        geom_smooth(method="loess", color="red", se=FALSE) +
+        xlab("Mean Protein Abundance (Log2)") +
+        ylab("Standard Deviation")
+    print(p)
+    cat('\n\n')
+}
+
+# Fit linear models
+fit.list <- lapply(
+    names(mm.list),
+    function(name) lmFit(dge_list[[name]]$counts, mm.list[[name]])
+) %>%
+set_names(names(mm.list))
+
+cat('### RSE\n\n')
+
+# Extract residual standard error (RSE):
+# smaller RSE indicates better fit
+sigma.df <- do.call("rbind",
+                    lapply(names(fit.list), function(name) {
+    # name <- 'axon.vs.neuron.in.wt'
+    df <- data.frame(contrast=name,
+                     rse=fit.list[[name]]$sigma)
+    return(df) })) %>%
+    mutate(contrast=factor(contrast, levels=names(fit.list)))
+
+# Create a boxplot comparing the RSEs
+p <- ggplot(sigma.df, aes(x=contrast, y=rse, fill=contrast)) +
+    geom_boxplot(color='black') +
+    theme_bw() +
+    scale_y_log10() +
+    ylab('log10(RSE)') +
+    theme(axis.text.x=element_text(hjust=1, angle=45),
+          legend.title=element_blank())
+
+print(p)
+
+# Save
+file.i <- file.path(figure.directory, 'fit_RSEs.pdf')
+ggsave(file.i,
+       p,
+       device='pdf')
+
+link.plot(file.i)
+```
+
+## DE testing {.tabset}
+
+
+```{r set_contrast}
+
+# - `WTAx_vs_WTCb`: WT_Ax vs WT_Cb
+# - `KOAx_vs_KOCb`: KO_Ax vs KO_Cb 
+# - `KOAx_vs_WTAx`: KO_Ax vs WT_Ax
+# - `KOCb_vs_WTCb`: KO_Cb vs WT_Cb
+# - `interaction`: (KO_Ax vs KO_Cb) vs (WT_Ax vs WT_Cb)
+
+#-------------------------- Manually specify contrasts ---------------------------------
+
+# Create a list storing contrasts
+contrast.list <- list(
+    WTAx_vs_WTCb=makeContrasts(
+        group_WT_Ax - group_WT_Cb,
+        levels=fit.list[['WTAx_vs_WTCb']]
+    ),
+    KOAx_vs_KOCb=makeContrasts(
+        group_KO_Ax - group_KO_Cb,
+        levels=fit.list[['KOAx_vs_KOCb']]
+    ),
+    KOAx_vs_WTAx=makeContrasts(
+        group_KO_Ax - group_WT_Ax,
+        levels=fit.list[['KOAx_vs_WTAx']]
+    ),
+    KOCb_vs_WTCb=makeContrasts(
+        group_KO_Cb - group_WT_Cb,
+        levels=fit.list[['KOCb_vs_WTCb']]
+    ),
+    interaction=makeContrasts(
+        (group_KO_Ax - group_KO_Cb) - (group_WT_Ax - group_WT_Cb), 
+        levels=fit.list[['interaction']]$design
+    )
+)
+
+```
+
+```{r results}
+
+# Create a list storing result data frames across the contrasts
+res_list <- lapply(names(contrast.list), function(name) {
+
+    # Estimate contrast for each gene
+    contrastfit <- contrasts.fit(fit.list[[name]], contrast.list[[name]])
+    # Run empirical Bayes smoothing of standard errors
+    # (shrinks standard errors that are much larger or smaller than those from other genes 
+    # towards the average standard error)
+    # (see https://www.degruyter.com/doi/10.2202/1544-6115.1027)
+    # NOTE:
+    # - Run limma=trend by specifying `trend=TRUE` for intensity input
+    contrastfit <- eBayes(contrastfit, trend=TRUE)
+    res.df <- topTable(
+        contrastfit,
+        confint=TRUE,
+        sort.by="P",
+        n=Inf,
+        adjust.method="BH") %>%
+        rownames_to_column(id.col)
+
+    # Prep a normalized count matrix
+    mat.df <- mat_input[rownames(dge_list[[name]]$counts),] %>%
+        as.data.frame() %>%
+        rownames_to_column(id.col)
+
+    # Add protein info to the result data frame
+    res.df <- res.df %>%
+        left_join(mat.df, by=id.col) %>%
+        left_join(input.df[,colnames(input.df) %in% nonsample.cols], by=id.col) %>%
+        unique()
+
+    return(res.df) }) %>%
+    set_names(names(contrast.list))
+
+# DE metrics:
+# - logFC: log2FoldChange
+# - AveExpr: average expression across all samples in a log2 scale with or without CPM transformation
+# - t: logFC devided by its standard error
+# - P.Value: raw p-value
+# - adj.P.Val: false discovery rate (FDR) computed by BH method
+# - B: log-odds from DE testing for each gene
+# - CI.L: left limit of confidence interval for logFC (if confint=TRUE or confint is numeric)
+# - CI.R: right limit of confidence interval for logFC (if confint=TRUE or confint is numeric)
+```
+
+Summary metrics:
+
+- **name**: contrast label
+- **up**: the number of differentially up-regulated proteins
+- **down**: the number of differentially down-regulated proteins
+- **filtered.vs.total**: the number of protein with minimum mean abundance intensity values
+  over all detected proteins
+- **alpha**: false discovery rate (FDR) threshold
+- **lfcThreshold**: fold change threshold in a log2 scale
+- **low.counts**: the number of proteins excluded from differential testing due to low intensity
+- **design**: the design, using R syntax. Originally described by 
+[Wilkinson 1973](https://www.jstor.org/stable/2346786), but see the 
+[section in R for Data Science](https://r4ds.had.co.nz/model-basics.html#formulas-and-model-families) as well.
+- **test**: contrast performed using the design
+
+```{r summary, results='asis'}
+
+# Create DE summary table
+slist <- lapply(names(res_list), function(name) {
+
+    res <- res_list[[name]]
+    # All proteins
+    unfiltered <- nrow(mat_input)
+    # Proteins used in the current analysis
+    filtered <- nrow(dge_list[[name]]$counts)
+    # Upregulated proteins (FDR < cutoff)
+    up <- sum(res$adj.P.Val < alpha & res$logFC > lfc.thresh, na.rm=TRUE)
+    # Downregulated proteins (FDR < cutoff)
+    down <- sum(res$adj.P.Val < alpha & res$logFC < -lfc.thresh, na.rm=TRUE)
+    df <- data.frame(name=name,
+                     up=up,
+                     down=down,
+                     filtered.vs.total=paste0(filtered, '/', unfiltered),
+                     alpha=alpha,
+                     lfcThreshold=lfc.thresh,
+                     low.counts=drop_list[[name]],
+                     design='~0+group',
+                     test=colnames(contrast.list[[name]]))
+
+    return(df) })
+
+summary.df <- do.call('rbind', slist)
+
+DT::datatable(summary.df)
+```
+
+Top `adj.P.Val` proteins are labeled in the following M-A and Volcano plots.
+
+```{r de_ma, results='asis'}
+
+res_updated_list <- list()
+
+for (name in names(res_list)) {
+
+    cat('\n\n###', name, '{.tabset}\n\n')
+
+    # Prep input data frame
+    res <- res_list[[name]]
+    res$Rank <- 1:nrow(res)
+    res <- mutate(res,
+                  significance=ifelse(adj.P.Val <= alpha, "sig", "insig"))
+    siggene.df <- res[res$significance == "sig",]
+    insiggene.df <- res[res$significance == "insig",]
+
+    res_updated_list[[name]] <- list(sig=siggene.df, insig=insiggene.df)
+
+    # Create MA plot
+    p <- ggplot(insiggene.df, aes(x=AveExpr, y=logFC)) +
+        geom_point(size=2, color="grey40") +
+        geom_point(data=siggene.df, size=2, color="red") +
+        theme_bw() +
+        theme(panel.grid.major=element_blank(),
+              panel.grid.minor=element_blank(),
+              legend.position="none") +
+        geom_hline(yintercept = 0, col="red", size=2, alpha=0.5)
+
+    if (nrow(siggene.df) > 0) {
+        topgene.df <- siggene.df %>%
+            mutate(Rank=1:nrow(siggene.df),
+                   Label=ifelse(Rank <= 10, Genes, "")) %>%
+            dplyr::filter(Label != "")
+        p <- p + 
+            geom_point(data=topgene.df, col="black", pch=1, size=3) +
+            ggrepel::geom_label_repel(data=topgene.df,
+                                      color="black",
+                                      max.overlaps=Inf,
+                                      aes(label=Label, fontface="italic"))
+
+    }
+
+    # Print and save the MA plot
+    cat('\n\n#### M-A plot\n\n')
+    print(p)
+
+    file.i <- file.path(figure.directory,
+                        paste0(name, "_MA.pdf"))
+    ggsave(file.i, p, device="pdf")
+    link.plot(file.i)
+
+    # Create volcano plot
+    p <- ggplot(insiggene.df, aes(x=logFC, y=-log10(adj.P.Val))) +
+        geom_point(size=2, color="grey40") +
+        geom_point(data=siggene.df, size=2, color="red") +
+        theme_bw() +
+        theme(panel.grid.major=element_blank(),
+              panel.grid.minor=element_blank(),
+              legend.position="none")
+
+    if (nrow(siggene.df) > 0) {
+        topgene.df <- siggene.df %>%
+            mutate(Rank=1:nrow(siggene.df),
+                   Label=ifelse(Rank <= 10, Genes, "")) %>%
+            dplyr::filter(Label != "")
+        p <- p + 
+            geom_point(data=topgene.df, col="black", pch=1, size=3) +
+            ggrepel::geom_label_repel(data=topgene.df,
+                                      color="black",
+                                      max.overlaps=Inf,
+                                      aes(label=Label, fontface="italic"))
+
+    }
+
+    # Print and save the volcano plot
+    cat('\n\n#### Volcano plot\n\n')
+    print(p)
+
+    file.i <- file.path(figure.directory,
+                        paste0(name, "_volcano.pdf"))
+    ggsave(file.i, p, device="pdf")
+    link.plot(file.i)
+
+
+    # Create histogram for p-values
+    p <- ggplot(res, aes(P.Value)) +
+        geom_histogram(fill="#a872ed", color='black', binwidth=0.02) + 
+        theme_bw() +
+        theme(panel.grid.major=element_blank(),
+              panel.grid.minor=element_blank()) +
+        ylab('Occurence')
+
+
+    # Print and save the histogram
+    cat('\n\n#### P-value distribution\n\n')
+    print(p)
+
+    file.i <- file.path(figure.directory,
+                        paste0(name, "_p_value.pdf"))
+    ggsave(file.i, p, device="pdf")
+    link.plot(file.i)
+}
+
+```
+
+# Exported results
+
+The files below are TSVs that can be opened in Excel or used progammatically with downstream tools. Refer
+to the following statistical metrics for detailed info: 
+
+- `UniProtIds`: [uniprot](https://www.uniprot.org/) identifiers
+- `AveExpr`: normalized mean intensity values in a log2 scale
+- `logFC`: log2 fold change values between the groups
+- `P.Value`: two-sided p-value
+- `adj.P.Val`: FDR (multiple hypothesis testing by BH method)
+- `t`: logFC divided by its standard error
+- `CI.L`: left limit of confidence interval for logFC (if confint=TRUE or confint is numeric)
+- `CI.R`: right limit of confidence interval for logFC (if confint=TRUE or confint is numeric)
+
+Additional columns provide protein info and normalized counts or intensities for each protein. **Note that
+differential testing was performed on log2-transformed abundance values by subset.**
+
+```{r write_output, results='asis'}
+# Write out files for full and each selection, and create a link to them in the
+# HTML generated by this RMarkdown.
+
+respath.list <- list()
+
+for (name in names(res_list)) {
+
+    # Clean result data frame
+    exclude_cols <- c(
+        'ProteinNames',
+        'Database',
+        'contrast',
+        outliers,
+        setdiff(
+            colnames(mat),
+            rownames(dge_list[[name]]$samples))
+    )
+    df <- res_list[[name]]
+    df <- df[, ! colnames(df) %in% exclude_cols]
+
+    # Assign file path
+    file.i <- file.path(
+        table.directory,
+        paste0(name, "_DE_results.tsv"))
+
+    # Save file path
+    respath.list[[name]] <- paste0('[', file.i, '](', file.i, ')')
+
+    # Save
+    write.table(df,
+                file.i,
+                sep="\t",
+                row.names=FALSE,
+                quote=FALSE)
+}
+
+knitr::kable(
+    data.frame( 
+        description=names(respath.list),
+        link=unname(unlist(respath.list))
+    )
+)
+```
+
+# Session info
+For reproducibility purposes, here is the output of `sessionInfo()` showing the
+versions of all packages used here.
+
+```{r sessioninfo}
+sessionInfo()
+```
